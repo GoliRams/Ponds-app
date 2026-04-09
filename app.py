@@ -67,12 +67,9 @@ def geocode_place(query):
         pass
     return []
 
-# ---------- POND DISCOVERY (NEW) ----------
+# ---------- POND DISCOVERY ----------
 @st.cache_data(show_spinner=False, ttl=3600)
 def discover_ponds(lat, lon, radius_km, max_ponds=500):
-    """Detect aquaculture ponds within a radius of a point.
-    Returns a list of dicts: {id, lat, lon, area_ha}.
-    """
     center = ee.Geometry.Point([lon, lat])
     aoi = center.buffer(radius_km * 1000)
 
@@ -82,7 +79,6 @@ def discover_ponds(lat, lon, radius_km, max_ponds=500):
             qa.bitwiseAnd(1 << 11).eq(0))
         return img.updateMask(cloud).divide(10000)
 
-    # Dry season composite (Jan–Apr) for cleaner pond detection
     end = datetime.utcnow()
     s2 = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
           .filterBounds(aoi)
@@ -103,7 +99,6 @@ def discover_ponds(lat, lon, radius_km, max_ponds=500):
         bestEffort=True
     )
 
-    # Add area & shape metrics
     def add_metrics(f):
         g = f.geometry()
         area = g.area(1)
@@ -122,7 +117,6 @@ def discover_ponds(lat, lon, radius_km, max_ponds=500):
 
     vectors = vectors.map(add_metrics)
 
-    # Filter: aquaculture pond shape & size
     ponds = vectors.filter(ee.Filter.And(
         ee.Filter.gte('area_ha', 0.3),
         ee.Filter.lte('area_ha', 8.0),
@@ -130,7 +124,6 @@ def discover_ponds(lat, lon, radius_km, max_ponds=500):
         ee.Filter.gt('fill_ratio', 0.55),
     ))
 
-    # Sort by size descending and cap
     ponds = ponds.sort('area_ha', False).limit(max_ponds)
 
     feats = ponds.getInfo()["features"]
@@ -224,45 +217,59 @@ if "map_center" not in st.session_state:
     st.session_state.map_center = [16.5449, 81.5212]
     st.session_state.map_zoom = 12
 if "discovered" not in st.session_state:
-    st.session_state.discovered = []       # list of dicts
+    st.session_state.discovered = []
 if "selected_pond" not in st.session_state:
     st.session_state.selected_pond = None
 if "tracked" not in st.session_state:
-    st.session_state.tracked = []          # list of (name, lat, lon)
+    st.session_state.tracked = []
 
 # ---------- SIDEBAR ----------
 st.sidebar.title("🦐 Ponds-app")
 st.sidebar.markdown("**Shrimp pond satellite monitor**")
 st.sidebar.markdown("---")
 
-# --- Place search ---
-st.sidebar.markdown("### 🔍 Find ponds near a place")
-search_query = st.sidebar.text_input(
-    "Town, village or landmark",
-    placeholder="e.g. Bhimavaram, Kaikalur"
+# --- Find ponds: by place name OR coordinates ---
+st.sidebar.markdown("### 🔍 Find ponds nearby")
+search_mode = st.sidebar.radio(
+    "Search by:",
+    ["Place name", "Latitude / Longitude"],
+    horizontal=True
 )
+
 radius_km = st.sidebar.slider("Search radius (km)", 2, 50, 10)
 max_ponds = st.sidebar.slider("Max ponds to show", 50, 1000, 300, step=50)
 
-if search_query:
-    results = geocode_place(search_query)
-    if results:
-        options = {r["display"]: (r["lat"], r["lon"]) for r in results}
-        choice = st.sidebar.selectbox("Select a match:", list(options.keys()))
-        if st.sidebar.button("🔎 Find ponds here"):
-            lat, lon = options[choice]
-            st.session_state.map_center = [lat, lon]
-            st.session_state.map_zoom = 13
-            with st.spinner(f"Searching for ponds within {radius_km} km…"):
-                try:
-                    st.session_state.discovered = discover_ponds(
-                        lat, lon, radius_km, max_ponds)
-                    st.session_state.selected_pond = None
-                except Exception as e:
-                    st.sidebar.error(f"Search failed: {e}")
-            st.rerun()
-    else:
-        st.sidebar.warning("No matches found.")
+search_lat, search_lon = None, None
+
+if search_mode == "Place name":
+    search_query = st.sidebar.text_input(
+        "Town, village or landmark",
+        placeholder="e.g. Bhimavaram, Kaikalur"
+    )
+    if search_query:
+        results = geocode_place(search_query)
+        if results:
+            options = {r["display"]: (r["lat"], r["lon"]) for r in results}
+            choice = st.sidebar.selectbox("Select a match:", list(options.keys()))
+            search_lat, search_lon = options[choice]
+        else:
+            st.sidebar.warning("No matches found.")
+else:
+    search_lat = st.sidebar.number_input("Latitude", value=16.5449, format="%.5f")
+    search_lon = st.sidebar.number_input("Longitude", value=81.5212, format="%.5f")
+
+if search_lat is not None and search_lon is not None:
+    if st.sidebar.button("🔎 Find ponds here"):
+        st.session_state.map_center = [float(search_lat), float(search_lon)]
+        st.session_state.map_zoom = 13
+        with st.spinner(f"Searching for ponds within {radius_km} km…"):
+            try:
+                st.session_state.discovered = discover_ponds(
+                    float(search_lat), float(search_lon), radius_km, max_ponds)
+                st.session_state.selected_pond = None
+            except Exception as e:
+                st.sidebar.error(f"Search failed: {e}")
+        st.rerun()
 
 st.sidebar.markdown("---")
 
@@ -309,7 +316,6 @@ st.caption("Satellite-based monitoring using Sentinel-2 (free, ~5 day revisit)")
 tab_monitor, tab_about = st.tabs(["📡 Monitor", "ℹ️ About / Benefits"])
 
 with tab_monitor:
-    # ---------- MAP ----------
     center = st.session_state.map_center
     zoom = st.session_state.map_zoom
 
@@ -320,7 +326,6 @@ with tab_monitor:
         attr="Esri World Imagery"
     )
 
-    # Draw search radius circle
     if st.session_state.discovered:
         folium.Circle(
             location=center,
@@ -331,7 +336,6 @@ with tab_monitor:
             popup=f"{radius_km} km search area"
         ).add_to(m)
 
-    # Draw discovered ponds (small dots)
     for p in st.session_state.discovered:
         is_selected = (st.session_state.selected_pond and
                        st.session_state.selected_pond["id"] == p["id"])
@@ -344,7 +348,6 @@ with tab_monitor:
             popup=f"{p['id']} — {p['area_ha']} ha",
         ).add_to(m)
 
-    # Draw tracked ponds (big markers)
     for n, la, lo in st.session_state.tracked:
         folium.Marker([la, lo], popup=n,
                       icon=folium.Icon(color="blue", icon="star")).add_to(m)
@@ -365,8 +368,9 @@ with tab_monitor:
             st.info(f"✅ Found **{len(st.session_state.discovered)} ponds**. "
                     "Pick one from the sidebar to see its history.")
         else:
-            st.info("👈 Search for a town in the sidebar to discover ponds nearby. "
-                    "New here? See the **About / Benefits** tab.")
+            st.info("👈 Search for a town OR enter coordinates in the sidebar "
+                    "to discover ponds nearby. New here? See the "
+                    "**About / Benefits** tab.")
     else:
         for name, lat, lon in ponds_to_show:
             st.markdown("---")
@@ -445,12 +449,13 @@ sleep better, and have proof when you need it.**
 
 ---
 
-## How to use it (new: auto-discovery)
+## How to use it
 
-1. In the sidebar, type a town name like **Bhimavaram** or your village.
-2. Pick from the dropdown matches.
-3. Set the search radius (start with 10 km) and click **Find ponds here**.
-4. The app discovers every aquaculture pond in that area (30–90 seconds).
+1. In the sidebar, choose **Place name** or **Latitude / Longitude**.
+2. Enter a town (e.g. *Bhimavaram*) or paste exact coordinates.
+3. Set the search radius (start with 10 km).
+4. Click **Find ponds here** — the app discovers every aquaculture
+   pond in that area (30–90 seconds).
 5. Pick any pond from the dropdown to see its 2-year satellite history.
 6. Click **Track this pond** to save it for comparison.
 
@@ -463,19 +468,19 @@ sleep better, and have proof when you need it.**
 **New way:** open the app, see the status of all ponds at once.
 
 ### 2. Get warned about algae problems early
-Shrimp ponds crash when algae grows too much. The satellite can see
-algae building up **2–3 weeks before your eye can**. Act early, save
-the crop.
+Shrimp ponds crash when algae grows too much. The satellite sees
+algae building up **2–3 weeks before the human eye can**. Act early,
+save the crop.
 
 ### 3. Know when your neighbors are in trouble
-When 3–4 ponds within 2 km of you suddenly drain early, the app warns
-you of likely disease pressure — a heads-up neighbors would never give
-you directly.
+When 3–4 ponds within 2 km of you drain early, the app warns you of
+likely disease pressure — a heads-up neighbors would never give you
+directly.
 
 ### 4. Automatic diary of every crop
-Auto-logs every fill and drain event from satellite history — going
-back 2 years, even if you never used the app before. Instant proof for
-loans and insurance.
+Auto-logs every fill and drain event from satellite history — 2 years
+back, even if you never used the app before. Instant proof for loans
+and insurance.
 
 ### 5. See cyclone damage without driving through floodwater
 Radar satellites show within hours which ponds have broken bunds after
@@ -493,9 +498,9 @@ This app uses free satellites, free mapping, and free cloud computing.
 No sensors, no hardware at the pond. ₹6,000 Android + 4G once a day.
 
 ### 9. Gets smarter as more farmers join
-Community early-warning system that grows stronger with each user.
+Community early-warning system that grows with each user.
 
-### 10. Helps the whole region, not just you
+### 10. Helps the whole region
 Cooperatives, feed companies, exporters, insurers, banks, and
 government all benefit from the same satellite layer.
 
@@ -515,7 +520,7 @@ government all benefit from the same satellite layer.
 
 ## ⚠️ Honest limitations
 
-- **Cannot directly see disease** — only detects patterns (early drains,
+- **Cannot directly see disease** — only patterns (early drains,
   bloom crashes). Always confirm on-pond.
 - **Ponds <0.3 ha** are unreliable at 10 m satellite resolution.
 - **Monsoon clouds** can leave 1–2 week gaps.
@@ -523,5 +528,5 @@ government all benefit from the same satellite layer.
 
 ---
 
-**Built for Andhra Pradesh shrimp farmers with satellite data.**
+**Built for Andhra Pradesh shrimp farmers with free, open satellite data.**
 """)
